@@ -1,22 +1,30 @@
-import dataclasses
+from dataclasses import dataclass
 import telegram
-from agents._openai import Openai
+from llm._openai import Openai
 from tools import Diary, GoogleTasks
 import logging
+from pathlib import Path
+
+TOOL_LIST = [{"toolName": "GoogleTasks", "class": GoogleTasks}, {"toolName": "Diary", "class": Diary}]
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
-@dataclasses.dataclass
+@dataclass
 class Handle:
     description: str
-    agentName: str
-    telegramChatId: int
+    agent_name: str
+    telegram_chat_id: int
     model: str
+    context_path: str
 
-    def __init__(self, description: str, agentName: str, telegramChatId: int, model: str):
-        self.description = description
-        self.agentName = agentName
-        self.telegramChatId = telegramChatId
-        self.model = model
+    def _build_context_from_md(self, context_path: Path) -> str:
+        if not context_path.is_dir():
+            raise NotADirectoryError(f"Not a directory: {context_path}")
+
+        markdown_files = sorted(context_path.glob("*.md"))
+
+        return "\n\n".join(file_path.read_text(encoding="utf-8") for file_path in markdown_files)
 
     def sendMessageAgent(self, channelType: str, text: str):  # TODO add chat id later
         """
@@ -24,13 +32,18 @@ class Handle:
         """
 
         agent = Openai()  # yea so much for abstraction
-        response = agent.get_response(text, self.description, self.model)  # what to do for tool loop calls?
-        logging.info(f"{self.agentName} RESPONSE: {response}")
+
+        context = self._build_context_from_md(Path(self.context_path))  # should add tools to here as well later
+        logging.debug(f"{self.agent_name} GIVEN CONTEXT: {context}")
+
+        response = agent.get_response(text, context=context, model=self.model)  # what to do for tool loop calls?
+        logging.debug(f"{self.agent_name} RESPONSE: {response}")
+        response_text = response.output_text.strip()
 
         if channelType == "cli":
-            print(f"{self.agentName} RESPONSE: {response}")
+            print(f"R: {response_text}")
         elif channelType == "telegram":
-            telegram.send_message(self.telegramChatId, response)  ## TODO
+            telegram.send_message(self.telegram_chat_id, response_text)  ## TODO
 
         return response
 
@@ -42,9 +55,6 @@ class Handle:
 
     def callTool(self, toolName: str, toolArgs: dict):
         pass
-
-
-toolList = [{"toolName": "GoogleTasks", "class": GoogleTasks}, {"toolName": "Diary", "class": Diary}]
 
 
 def loadHandle(handleName: str = "default") -> Handle:
@@ -60,18 +70,19 @@ def loadHandle(handleName: str = "default") -> Handle:
         if handle.get("handleName") == handleName:
             return Handle(
                 description=handle.get("description"),
-                agentName=handle.get("agentName"),
-                telegramChatId=handle.get("telegramChatId"),
+                agent_name=handle.get("agentName"),
+                telegram_chat_id=handle.get("telegramChatId"),
                 model=handle.get("model"),
+                context_path=handle.get("contextPath"),
             )
 
     raise ValueError(f"Handle with name {handleName} not found.")
 
 
 if __name__ == "__main__":
-    handle = loadHandle()
+    handle = loadHandle("Confused Bob")
 
     while True:
         text = input(f"\nenter text \n")
         resp = handle.sendMessageAgent(text=text, channelType="cli")
-        print(resp.model_dump_json(indent=4))
+        # print(resp.model_dump_json(indent=4))

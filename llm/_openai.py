@@ -12,6 +12,6 @@ class Openai(Agent):
         return client.responses.create(
             model=model,
             # reasoning={"effort": "low"},
-            # instructions=context,
+            instructions=context,
             input=prompt,
         )
