@@ -1,0 +1,1 @@
+# context = SOUL.md + IDENTITY.md + MEMORY.md

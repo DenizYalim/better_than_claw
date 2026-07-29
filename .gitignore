@@ -4,4 +4,4 @@ token.json
 __pycache__/
 *.pyc
 *.json
-*.md
+lifeCoach/
