@@ -30,11 +30,11 @@ class Openai(Agent):
         )
 
 
-def __get_conversation_id() -> str:
+def get_conversation_id() -> str:
     # Create a new conversation and return its ID
     convo = client.conversations.create()
     return convo.id
 
 
 if __name__ == "__main__":
-    print(__get_conversation_id())
+    print(get_conversation_id())

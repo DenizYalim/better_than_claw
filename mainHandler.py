@@ -1,6 +1,6 @@
 from dataclasses import dataclass
 import telegram
-from llm._openai import Openai
+from llm._openai import Openai, get_conversation_id
 from tools import Diary, GoogleTasks
 import logging
 from pathlib import Path
@@ -57,7 +57,7 @@ class Handle:
         pass
 
 
-def loadHandle(handleName: str = "default") -> Handle:
+def loadHandle(handleName: str = "default", conversation_id: str = None) -> Handle:
     import json
 
     try:
@@ -68,20 +68,22 @@ def loadHandle(handleName: str = "default") -> Handle:
 
     for handle in handles:
         if handle.get("handleName") == handleName:
+
             return Handle(
                 description=handle.get("description"),
                 agent_name=handle.get("agentName"),
                 telegram_chat_id=handle.get("telegramChatId"),
                 model=handle.get("model"),
                 context_path=handle.get("contextPath"),
-                conversation_id=handle.get("conversationId"),
+                conversation_id=conversation_id,  # handle.get("conversationId"), # hm
             )
 
     raise ValueError(f"Handle with name {handleName} not found.")
 
 
 if __name__ == "__main__":
-    handle = loadHandle()
+    convo_id = get_conversation_id()
+    handle = loadHandle(conversation_id=convo_id)
 
     while True:
         text = input(f"\nenter text \n")
