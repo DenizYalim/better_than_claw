@@ -17,6 +17,7 @@ class Handle:
     telegram_chat_id: int
     model: str
     context_path: str
+    conversation_id: str  # this can be optional
 
     def _build_context_from_md(self, context_path: Path) -> str:
         if not context_path.is_dir():
@@ -35,8 +36,7 @@ class Handle:
 
         context = self._build_context_from_md(Path(self.context_path))  # should add tools to here as well later
         logging.debug(f"{self.agent_name} GIVEN CONTEXT: {context}")
-
-        response = agent.get_response(text, context=context, model=self.model)  # what to do for tool loop calls?
+        response = agent.get_response(text, context=context, model=self.model, conversation_id=self.conversation_id)  # what to do for tool loop calls?
         logging.debug(f"{self.agent_name} RESPONSE: {response}")
         response_text = response.output_text.strip()
 
@@ -74,13 +74,14 @@ def loadHandle(handleName: str = "default") -> Handle:
                 telegram_chat_id=handle.get("telegramChatId"),
                 model=handle.get("model"),
                 context_path=handle.get("contextPath"),
+                conversation_id=handle.get("conversationId"),
             )
 
     raise ValueError(f"Handle with name {handleName} not found.")
 
 
 if __name__ == "__main__":
-    handle = loadHandle("Confused Bob")
+    handle = loadHandle()
 
     while True:
         text = input(f"\nenter text \n")
