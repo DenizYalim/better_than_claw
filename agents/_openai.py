@@ -1,11 +1,17 @@
-from agent import Agent
+from .agent import Agent
+from openai import OpenAI
+import dotenv
+import os
+
+dotenv.load_dotenv()
+client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 
 class Openai(Agent):
     def get_response(self, prompt: str, context: str, model: str) -> str:
-        """
-        This method is responsible for sending the prompt and context to the OpenAI API
-        and returning the response.
-        """
-
-        pass
+        return client.responses.create(
+            model=model,
+            # reasoning={"effort": "low"},
+            # instructions=context,
+            input=prompt,
+        )

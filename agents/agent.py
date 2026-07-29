@@ -1,10 +1,9 @@
 # this abstraction is not useful as i wont add anything other than openai
-import abc
+from abc import ABC, abstractmethod
 
 
-@abs
-class Agent:
-    @abc.abstractmethod
+class Agent(ABC):
+    @abstractmethod
     def get_response(self, prompt: str, context: str, model: str) -> str:
         """ """
 

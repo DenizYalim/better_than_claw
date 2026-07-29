@@ -1,5 +1,5 @@
 # creates diary logs
-from tool import Tool
+from .tool import Tool
 
 
 class Diary(Tool):

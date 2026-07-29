@@ -1,9 +1,8 @@
-import abc
+from abc import ABC, abstractmethod
 
 
-@abc
-class Tool(abc.ABC):
-    @abc.abstractmethod
+class Tool(ABC):
+    @abstractmethod
     def getToolInformation(self) -> dict:  # str ?
         """Return information about the tool."""
         pass
