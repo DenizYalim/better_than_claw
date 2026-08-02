@@ -27,7 +27,7 @@ NOT_CONNECTED = {
 
 
 def _guard(fn, *args, **kwargs) -> Any:
-    """Turn setup problems into results the model can explain, not exceptions."""
+    """Turn setup and API problems into results the model can explain."""
 
     try:
         return fn(*args, **kwargs)
@@ -38,6 +38,38 @@ def _guard(fn, *args, **kwargs) -> Any:
     except RuntimeError as exc:
         # Missing google client libraries land here.
         return {"connected": False, "message": str(exc)}
+    except Exception as exc:
+        status = _http_status(exc)
+
+        if status is None:
+            raise
+
+        # A raw HttpError repr is a URL-encoded wall the model cannot act on,
+        # and it is not a bug in our code, so it should not log a traceback
+        # either. Say what went wrong and what to do about it.
+        hint = {
+            400: "The task or list id is wrong. Call list_tasks again and use the ids it returns.",
+            403: "Google refused this. The account may not have access to that list.",
+            404: "That task or list no longer exists. Call list_tasks again.",
+            429: "Too many requests to Google just now. Try again shortly.",
+        }.get(status, "Google rejected the request.")
+
+        # Not keyed "ok": the registry already wraps this in {"ok": true} to mean
+        # "the tool ran", and a nested ok:false inside ok:true reads as a
+        # contradiction to whatever has to interpret it.
+        return {"failed": True, "status": status, "message": hint}
+
+
+def _http_status(exc: Exception) -> int | None:
+    """HTTP status from a googleapiclient error, or None if it is not one."""
+
+    response = getattr(exc, "resp", None)
+    status = getattr(response, "status", None) or getattr(exc, "status_code", None)
+
+    try:
+        return int(status) if status is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 class ListTasks(Tool):

@@ -104,11 +104,18 @@ class Handle:
             f" [{', '.join(result.tool_calls)}]" if result.tool_calls else "",
         )
 
+        if not response_text:
+            # Say so here rather than downstream: once the stats footer is
+            # appended the text is no longer empty, so send_reply's own guard
+            # would not fire and the user would receive a bare "T:3.9K - 2sec".
+            logging.warning("%s returned an empty response", self.agent_name)
+            response_text = "(the agent returned an empty response)"
+
         if with_stats:
             stats = formatStats(result.total_tokens, elapsed)
             # Blank line so the footer reads as metadata rather than as
             # something the coach said.
-            response_text = f"{response_text}\n\n{stats}" if response_text else stats
+            response_text = f"{response_text}\n\n{stats}"
 
         if channelType == "cli":
             print(f"R: {response_text}")
