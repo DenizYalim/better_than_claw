@@ -1,5 +1,7 @@
 from .agent import Agent
+from dataclasses import dataclass, field
 from openai import OpenAI
+from typing import Any
 import dotenv
 import json
 import logging
@@ -9,6 +11,38 @@ dotenv.load_dotenv()
 client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AgentResult:
+    """A finished turn: the reply plus what it cost.
+
+    Tokens are summed over every request in the turn, not just the last one.
+    A tool-using turn makes several calls and each one re-sends the whole
+    conversation, so reporting only the final response would understate a
+    four-round check-in several times over.
+    """
+
+    response: Any
+    total_tokens: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    rounds: int = 1
+    tool_calls: list[str] = field(default_factory=list)
+
+    @property
+    def text(self) -> str:
+        return (self.response.output_text or "").strip()
+
+    def add_usage(self, response: Any) -> None:
+        usage = getattr(response, "usage", None)
+
+        if usage is None:
+            return
+
+        self.total_tokens += getattr(usage, "total_tokens", 0) or 0
+        self.input_tokens += getattr(usage, "input_tokens", 0) or 0
+        self.output_tokens += getattr(usage, "output_tokens", 0) or 0
 
 # A check-in legitimately chains several calls: list_tasks -> list_goals ->
 # update_goal -> log_checkin. This caps a model that gets stuck calling the
@@ -48,14 +82,17 @@ class Openai(Agent):
 
         response = client.responses.create(input=prompt, **request)
 
+        result = AgentResult(response=response)
+        result.add_usage(response)
+
         if tools is None or not len(tools):
-            return response
+            return result
 
         for round_number in range(MAX_TOOL_ROUNDS):
             calls = _pending_calls(response)
 
             if not calls:
-                return response
+                return result
 
             # Only the outputs go back. The calls themselves are already stored
             # server-side against the conversation, so resending them would
@@ -75,13 +112,18 @@ class Openai(Agent):
                 ", ".join(call.name for call in calls),
             )
 
+            result.tool_calls.extend(call.name for call in calls)
+            result.rounds += 1
+
             response = client.responses.create(input=outputs, **request)
+            result.response = response
+            result.add_usage(response)
 
         logger.warning("Hit MAX_TOOL_ROUNDS (%d); closing out.", MAX_TOOL_ROUNDS)
 
-        return self._close_out(response, request)
+        return self._close_out(result, request)
 
-    def _close_out(self, response, request):
+    def _close_out(self, result, request):
         """Answer any tool calls left dangling, then force a text reply.
 
         Leaving a function_call unanswered corrupts the stored conversation
@@ -92,10 +134,10 @@ class Openai(Agent):
         we would again have to close.
         """
 
-        calls = _pending_calls(response)
+        calls = _pending_calls(result.response)
 
         if not calls:
-            return response
+            return result
 
         refusal = json.dumps(
             {"ok": False, "error": "Tool budget for this turn is used up. Answer with what you have."}
@@ -107,12 +149,16 @@ class Openai(Agent):
         ]
 
         try:
-            return client.responses.create(
+            response = client.responses.create(
                 input=outputs, **{**request, "tool_choice": "none"}
             )
+            result.response = response
+            result.rounds += 1
+            result.add_usage(response)
         except Exception:
             logger.exception("Could not close out dangling tool calls")
-            return response
+
+        return result
 
 
 def _pending_calls(response) -> list:

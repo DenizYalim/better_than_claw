@@ -11,7 +11,9 @@ Press Ctrl+C to stop.
 
 import logging
 import os
+import threading
 import time
+from contextlib import contextmanager
 
 import dotenv
 
@@ -124,6 +126,42 @@ def send_reply(chat_id: int, text: str, reply_to_message_id: int | None = None) 
         )
 
 
+# Telegram drops the indicator after ~5s, so it has to be refreshed while the
+# agent thinks. A tool-using turn can take the best part of a minute.
+TYPING_REFRESH_SECONDS = 4.0
+
+
+@contextmanager
+def typing(chat_id: int):
+    """Keep "typing..." visible for as long as the block runs.
+
+    Purely cosmetic, so it must never affect the reply: the refresh runs on a
+    daemon thread and swallows its own errors. A failed chat action is not a
+    reason to lose a message the user is waiting for.
+    """
+
+    stop = threading.Event()
+
+    def refresh() -> None:
+        while not stop.is_set():
+            try:
+                telegram.send_chat_action(chat_id, "typing")
+            except Exception:
+                logger.debug("typing indicator failed for %s", chat_id, exc_info=True)
+                return
+
+            stop.wait(TYPING_REFRESH_SECONDS)
+
+    worker = threading.Thread(target=refresh, daemon=True)
+    worker.start()
+
+    try:
+        yield
+    finally:
+        stop.set()
+        worker.join(timeout=1)
+
+
 def switch_agent(chat_id: int, argument: str) -> str:
     """Show or change which agent this chat talks to."""
 
@@ -211,7 +249,8 @@ def on_update(update: dict) -> None:
         text = text.strip()
         logger.info("[%s] %s", chat_id, text)
 
-        reply = answer(chat_id, text)
+        with typing(chat_id):
+            reply = answer(chat_id, text)
 
         send_reply(chat_id, reply, reply_to_message_id=message_id)
 

@@ -253,6 +253,44 @@ def reopen_task(
     )
 
 
+def move_task(
+    task_id: str,
+    destination_tasklist: str,
+    tasklist: str | None = None,
+    parent: str | None = None,
+    previous: str | None = None,
+    credentials_path: str | Path | None = None,
+    token_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """
+    Move a task to a different task list.
+
+    Uses the move endpoint's destinationTasklist, so the task keeps its id and
+    history. Recreating it elsewhere and deleting the original would lose both.
+    """
+    if not task_id or not task_id.strip():
+        raise ValueError("task_id is required")
+    if not destination_tasklist or not destination_tasklist.strip():
+        raise ValueError("destination_tasklist is required")
+
+    service = connect_google_tasks(credentials_path, token_path)
+    source = _tasklist_id(tasklist)
+
+    move_args: dict[str, Any] = {
+        "tasklist": source,
+        "task": task_id.strip(),
+        "destinationTasklist": destination_tasklist.strip(),
+    }
+    if parent is not None:
+        move_args["parent"] = parent
+    if previous is not None:
+        move_args["previous"] = previous
+
+    result = service.tasks().move(**move_args).execute()
+
+    return _simplify_task(result, destination_tasklist.strip())
+
+
 def get_tasks_for_day(
     day: str | date | datetime | None = None,
     tasklist: str | None = None,
@@ -303,7 +341,7 @@ def get_tasks_for_day(
 def get_day_review(
     day: str | date | datetime | None = None,
     tasklist: str | None = "all",
-    max_open: int = 40,
+    max_open: int = 20,
     credentials_path: str | Path | None = None,
     token_path: str | Path | None = None,
 ) -> dict[str, Any]:
@@ -342,7 +380,7 @@ def get_day_review(
             include_completed=True,
         ):
             if task.get("status") == "completed":
-                completed.append(_simplify_task(task, tasklist_id, tasklist_title))
+                completed.append(_compact_task(task, tasklist_id, tasklist_title))
 
         for task in _list_tasks(
             service=service,
@@ -350,13 +388,18 @@ def get_day_review(
             include_completed=False,
         ):
             if task.get("status") != "completed":
-                still_open.append(_simplify_task(task, tasklist_id, tasklist_title))
+                still_open.append(_compact_task(task, tasklist_id, tasklist_title))
 
     overdue = [
         task
         for task in still_open
         if task.get("due") and _date_from_value(task["due"]) < selected_day
     ]
+
+    # Overdue work is the part worth talking about, so it goes to the front of
+    # the truncated list rather than being cut off at the bottom of it.
+    overdue_ids = {task["id"] for task in overdue}
+    still_open.sort(key=lambda task: task["id"] not in overdue_ids)
 
     return {
         "day": selected_day.isoformat(),
@@ -367,6 +410,12 @@ def get_day_review(
         "open": still_open[:max_open],
         "open_truncated": len(still_open) > max_open,
         "has_no_tasks_at_all": not completed and not still_open,
+        # Returned here rather than behind a separate tool: the model needs
+        # list ids to file or move anything, and it always calls this first.
+        "task_lists": [
+            {"id": task_list["id"], "title": task_list.get("title")}
+            for task_list in task_lists
+        ],
     }
 
 
@@ -519,6 +568,37 @@ def _day_bounds_rfc3339(value: str | date | datetime | None) -> tuple[str, str]:
 
 def _rfc3339(value: datetime) -> str:
     return value.astimezone(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
+def _compact_task(
+    task: dict[str, Any],
+    tasklist_id: str | None = None,
+    tasklist_title: str | None = None,
+) -> dict[str, Any]:
+    """A task trimmed to what the model can act on.
+
+    Used for list output, where the full shape is the difference between a
+    workable prompt and a slow one: web links, positions and timestamps are
+    dead weight repeated once per task, and a busy day has dozens.
+    """
+    notes = task.get("notes") or None
+
+    if notes and len(notes) > 200:
+        notes = notes[:200] + "..."
+
+    compact = {
+        "id": task.get("id"),
+        "title": task.get("title"),
+        # Google stores dates as midnight UTC; the time half is never useful.
+        "due": (task.get("due") or "")[:10] or None,
+        "tasklist_id": tasklist_id,
+        "tasklist_title": tasklist_title,
+    }
+
+    if notes:
+        compact["notes"] = notes
+
+    return compact
 
 
 def _simplify_task(

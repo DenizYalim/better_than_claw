@@ -66,6 +66,25 @@ def send_message(
     return telegram_request("sendMessage", payload, bot_token)
 
 
+def send_chat_action(
+    chat_id: int | str,
+    action: str = "typing",
+    bot_token: str | None = None,
+    message_thread_id: int | None = None,
+) -> dict[str, Any]:
+    """Show "typing..." in the chat.
+
+    Telegram clears it after about five seconds or as soon as a message
+    arrives, so a slow reply needs this repeated rather than sent once.
+    """
+    payload = {
+        "chat_id": chat_id,
+        "action": action,
+        "message_thread_id": message_thread_id,
+    }
+    return telegram_request("sendChatAction", payload, bot_token)
+
+
 def get_me(bot_token: str | None = None) -> dict[str, Any]:
     """Return basic information about the bot and validate the token."""
     return telegram_request("getMe", bot_token=bot_token)

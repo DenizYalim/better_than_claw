@@ -34,7 +34,13 @@ def build_registry(
     available = {tool.name: tool for tool in tools}
 
     groups = {
-        "google_tasks": ["list_tasks", "create_task", "complete_task"],
+        "google_tasks": [
+            "list_tasks",
+            "create_task",
+            "complete_task",
+            "update_task",
+            "move_task",
+        ],
         "goals": ["list_goals", "add_goal", "update_goal", "log_checkin"],
         "context": ["read_context_file", "remember", "update_context_file"],
     }

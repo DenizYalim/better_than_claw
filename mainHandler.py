@@ -1,5 +1,6 @@
 from dataclasses import dataclass, field
 import json
+import time
 from llm._openai import Openai, get_conversation_id
 from tools import build_registry
 from tools._store import read_json as _loadStore, update_json as _updateStore
@@ -14,6 +15,28 @@ ACTIVE_HANDLES_PATH = BASE_DIR / "active_handles.json"
 DEFAULT_HANDLE = "default"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+
+def formatTokens(count: int) -> str:
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.1f}M"
+    if count >= 1_000:
+        return f"{count / 1_000:.1f}K"
+    return str(count)
+
+
+def formatDuration(seconds: float) -> str:
+    # Sub-10s replies are the common case, and "3sec" vs "3.4sec" is the
+    # difference between useless and informative at that scale. The bound is
+    # 9.95 rather than 10 so a value that rounds to ten prints "10sec", not
+    # "10.0sec".
+    if seconds < 9.95:
+        return f"{seconds:.1f}sec"
+    return f"{seconds:.0f}sec"
+
+
+def formatStats(total_tokens: int, seconds: float) -> str:
+    return f"T:{formatTokens(total_tokens)} - {formatDuration(seconds)}"
 
 
 @dataclass
@@ -35,14 +58,16 @@ class Handle:
 
         return "\n\n".join(file_path.read_text(encoding="utf-8") for file_path in markdown_files)
 
-    def sendMessageAgent(self, channelType: str, text: str) -> str:
+    def sendMessageAgent(self, channelType: str, text: str, with_stats: bool = True) -> str:
         """
         gelen prompt + context + kişilik + memory -> agent -> response|tool calls -> response text
 
-        Returns the reply text. Delivery is the caller's job: the webhook knows
-        the real chat_id, this class does not.
+        Returns the reply text, with a token/time footer unless with_stats is
+        False. Delivery is the caller's job: the poller knows the real chat_id,
+        this class does not.
         """
 
+        started = time.monotonic()
         agent = Openai()  # yea so much for abstraction
 
         context = self._build_context_from_md(Path(self.context_path))
@@ -58,15 +83,32 @@ class Handle:
             context_path=self.context_path,
         )
 
-        response = agent.get_response(
+        result = agent.get_response(
             text,
             context=context,
             model=self.model,
             conversation_id=self.conversation_id,
             tools=tools,
         )
-        logging.debug(f"{self.agent_name} RESPONSE: {response}")
-        response_text = response.output_text.strip()
+        logging.debug(f"{self.agent_name} RESPONSE: {result.response}")
+
+        elapsed = time.monotonic() - started
+        response_text = result.text
+
+        logging.info(
+            "%s replied in %.1fs using %d tokens over %d round(s)%s",
+            self.agent_name,
+            elapsed,
+            result.total_tokens,
+            result.rounds,
+            f" [{', '.join(result.tool_calls)}]" if result.tool_calls else "",
+        )
+
+        if with_stats:
+            stats = formatStats(result.total_tokens, elapsed)
+            # Blank line so the footer reads as metadata rather than as
+            # something the coach said.
+            response_text = f"{response_text}\n\n{stats}" if response_text else stats
 
         if channelType == "cli":
             print(f"R: {response_text}")
