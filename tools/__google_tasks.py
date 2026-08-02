@@ -342,6 +342,7 @@ def get_day_review(
     day: str | date | datetime | None = None,
     tasklist: str | None = "all",
     max_open: int = 20,
+    max_completed: int = 20,
     credentials_path: str | Path | None = None,
     token_path: str | Path | None = None,
 ) -> dict[str, Any]:
@@ -353,8 +354,13 @@ def get_day_review(
     not due date, so finishing something early or late still counts for the
     day you actually did it.
 
-    Open tasks are capped at max_open so a neglected list cannot flood the
-    model's context; the count reported is the true total.
+    Both lists are capped, because either can run away: a neglected backlog
+    swells the open list, and a day spent clearing one swells the completed
+    list. The counts reported are always the true totals, so the model can say
+    "you finished 30 things" while only reading the most recent 20.
+
+    Note the caps trim what is *returned*, not what is fetched - every task is
+    still paged through, because open_count and overdue_count have to be right.
     """
     service = connect_google_tasks(credentials_path, token_path)
     selected_day = _date_from_value(day)
@@ -380,7 +386,11 @@ def get_day_review(
             include_completed=True,
         ):
             if task.get("status") == "completed":
-                completed.append(_compact_task(task, tasklist_id, tasklist_title))
+                # Keep the raw completion timestamp for sorting; _compact_task
+                # drops it, and without it "most recent" would be arbitrary.
+                completed.append(
+                    (task.get("completed") or "", _compact_task(task, tasklist_id, tasklist_title))
+                )
 
         for task in _list_tasks(
             service=service,
@@ -401,15 +411,21 @@ def get_day_review(
     overdue_ids = {task["id"] for task in overdue}
     still_open.sort(key=lambda task: task["id"] not in overdue_ids)
 
+    # Most recently finished first: if the list is trimmed, what survives is
+    # what they just did, which is what a check-in is actually about.
+    completed.sort(key=lambda pair: pair[0], reverse=True)
+    completed_tasks = [task for _, task in completed]
+
     return {
         "day": selected_day.isoformat(),
-        "completed_count": len(completed),
+        "completed_count": len(completed_tasks),
         "open_count": len(still_open),
         "overdue_count": len(overdue),
-        "completed": completed,
+        "completed": completed_tasks[:max_completed],
+        "completed_truncated": len(completed_tasks) > max_completed,
         "open": still_open[:max_open],
         "open_truncated": len(still_open) > max_open,
-        "has_no_tasks_at_all": not completed and not still_open,
+        "has_no_tasks_at_all": not completed_tasks and not still_open,
         # Returned here rather than behind a separate tool: the model needs
         # list ids to file or move anything, and it always calls this first.
         "task_lists": [
