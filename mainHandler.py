@@ -14,6 +14,16 @@ ACTIVE_HANDLES_PATH = BASE_DIR / "active_handles.json"
 
 DEFAULT_HANDLE = "default"
 
+# Every request re-sends the whole stored conversation, and tool results are
+# stored too - a single list_tasks result is over a thousand tokens and is then
+# replayed on every round of every later message, forever. Past this size a
+# chat starts a fresh conversation.
+#
+# This is only safe because durable memory does not live in the conversation:
+# goals, check-ins and MEMORY.md are held by tools and survive a rotation. What
+# is lost is the recent back-and-forth, which is the cheap part to lose.
+MAX_CONVERSATION_TOKENS = 30_000
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
 
@@ -49,6 +59,8 @@ class Handle:
     conversation_id: str  # this can be optional
     tool_names: list[str] = field(default_factory=list)
     chat_id: int | None = None
+    # The key conversations are stored under, so a handle can rotate its own.
+    handle_name: str = ""
 
     def _build_context_from_md(self, context_path: Path) -> str:
         if not context_path.is_dir():
@@ -96,13 +108,17 @@ class Handle:
         response_text = result.text
 
         logging.info(
-            "%s replied in %.1fs using %d tokens over %d round(s)%s",
+            "%s replied in %.1fs using %d tokens over %d round(s), history %d%s",
             self.agent_name,
             elapsed,
             result.total_tokens,
             result.rounds,
+            result.last_input_tokens,
             f" [{', '.join(result.tool_calls)}]" if result.tool_calls else "",
         )
+
+        if self.handle_name:
+            rotateIfTooLarge(self.handle_name, self.chat_id, result.last_input_tokens)
 
         if not response_text:
             # Say so here rather than downstream: once the stats footer is
@@ -145,6 +161,7 @@ def loadHandle(handleName: str = "default", conversation_id: str = None, chat_id
                 conversation_id=conversation_id or handle.get("conversationId"),
                 tool_names=handle.get("tools") or [],
                 chat_id=chat_id,
+                handle_name=handleName,
             )
 
     raise ValueError(f"Handle with name {handleName} not found.")
@@ -218,6 +235,29 @@ def conversationIdFor(handleName: str, chat_id: int) -> str:
         return conversations[key]
 
     return _updateStore(CONVERSATIONS_PATH, mutate)
+
+
+def rotateIfTooLarge(handleName: str, chat_id: int, last_input_tokens: int) -> bool:
+    """Start a fresh conversation once the old one is expensive to carry.
+
+    Called after replying, so the current turn is unaffected and the saving
+    lands on the next message.
+    """
+
+    if chat_id is None or last_input_tokens < MAX_CONVERSATION_TOKENS:
+        return False
+
+    previous = resetConversation(handleName, chat_id)
+
+    logging.warning(
+        "Conversation for %s:%s reached %d input tokens; rotated. Previous: %s",
+        handleName,
+        chat_id,
+        last_input_tokens,
+        previous,
+    )
+
+    return True
 
 
 def resetConversation(handleName: str, chat_id: int) -> str | None:

@@ -259,10 +259,12 @@ class UpdateGoal(ChatScopedTool):
 class LogCheckin(ChatScopedTool):
     name = "log_checkin"
     description = (
-        "Save a dated summary of what the user did today and how it relates to "
-        "their goals. Call this once per check-in conversation, after you have "
-        "understood what they got done. It is what lets you notice patterns "
-        "across days."
+        "Save a dated summary of what the user DID today. Call this only after "
+        "they have described their day or reported progress, and at most once "
+        "per conversation. Do NOT call it when they ask a question, state a "
+        "preference, or give an instruction: there is nothing to record about a "
+        "day you have not been told about, and every needless entry is re-sent "
+        "to you on every later message."
     )
     parameters = {
         "type": "object",

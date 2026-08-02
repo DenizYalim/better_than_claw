@@ -30,6 +30,12 @@ class AgentResult:
     rounds: int = 1
     tool_calls: list[str] = field(default_factory=list)
 
+    #: Input tokens of the final request alone. Every request re-sends the
+    #: whole stored conversation, so this is the closest thing to "how big has
+    #: this conversation become", and it is what a rotation policy needs -
+    #: input_tokens sums the rounds and would grow just from using more tools.
+    last_input_tokens: int = 0
+
     @property
     def text(self) -> str:
         return (self.response.output_text or "").strip()
@@ -43,6 +49,7 @@ class AgentResult:
         self.total_tokens += getattr(usage, "total_tokens", 0) or 0
         self.input_tokens += getattr(usage, "input_tokens", 0) or 0
         self.output_tokens += getattr(usage, "output_tokens", 0) or 0
+        self.last_input_tokens = getattr(usage, "input_tokens", 0) or 0
 
 # A check-in legitimately chains several calls: list_tasks -> list_goals ->
 # update_goal -> log_checkin. This caps a model that gets stuck calling the
