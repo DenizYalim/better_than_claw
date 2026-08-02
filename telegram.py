@@ -13,9 +13,19 @@ from typing import Any
 API_BASE_URL = "https://api.telegram.org"
 DEFAULT_TIMEOUT_SECONDS = 30
 
+# During a long poll Telegram deliberately holds the connection open for the
+# full timeout before answering. The socket read timeout must therefore be
+# longer than the poll window, or the socket gives up at the exact moment the
+# reply is due and every idle cycle dies.
+READ_TIMEOUT_BUFFER_SECONDS = 15
+
 
 class TelegramAPIError(RuntimeError):
     """Raised when Telegram returns an API error."""
+
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def send_message(
@@ -80,7 +90,12 @@ def get_updates(
         "limit": limit,
         "allowed_updates": allowed_updates,
     }
-    return telegram_request("getUpdates", payload, bot_token)
+    return telegram_request(
+        "getUpdates",
+        payload,
+        bot_token,
+        read_timeout=timeout + READ_TIMEOUT_BUFFER_SECONDS,
+    )
 
 
 def listen(
@@ -190,6 +205,7 @@ def telegram_request(
     method: str,
     payload: dict[str, Any] | None = None,
     bot_token: str | None = None,
+    read_timeout: float | None = None,
 ) -> Any:
     """Call a Telegram Bot API method and return its result field."""
     token = _resolve_bot_token(bot_token)
@@ -203,11 +219,19 @@ def telegram_request(
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=DEFAULT_TIMEOUT_SECONDS) as resp:
+        with urllib.request.urlopen(
+            request,
+            timeout=read_timeout if read_timeout is not None else DEFAULT_TIMEOUT_SECONDS,
+        ) as resp:
             response = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raise _error_from_http(method, exc) from exc
     except urllib.error.URLError as exc:
+        raise TelegramAPIError(f"Telegram API {method} request failed: {exc}") from exc
+    except OSError as exc:
+        # A socket read timeout surfaces as a bare TimeoutError, not URLError,
+        # so without this it escapes as a non-TelegramAPIError and defeats
+        # every caller's retry handling.
         raise TelegramAPIError(f"Telegram API {method} request failed: {exc}") from exc
 
     if not response.get("ok"):
@@ -271,5 +295,6 @@ def _error_from_http(method: str, exc: urllib.error.HTTPError) -> TelegramAPIErr
     except json.JSONDecodeError:
         description = body
     return TelegramAPIError(
-        f"Telegram API {method} failed with HTTP {exc.code}: {description}"
+        f"Telegram API {method} failed with HTTP {exc.code}: {description}",
+        status_code=exc.code,
     )

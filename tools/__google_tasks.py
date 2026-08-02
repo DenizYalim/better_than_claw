@@ -10,24 +10,42 @@ from typing import Any
 SCOPES = ["https://www.googleapis.com/auth/tasks"]
 DEFAULT_TASKLIST = "@default"
 
+# Building a service performs an API discovery fetch, and every public function
+# here starts by connecting. Without this cache a "find task then complete it"
+# flow pays for auth and discovery twice.
+_SERVICE_CACHE: dict[tuple[str, str], Any] = {}
+
+
+class GoogleTasksNotConnected(RuntimeError):
+    """Raised when there is no usable token and we refuse to prompt for one."""
+
 
 def connect_google_tasks(
     credentials_path: str | Path | None = None,
     token_path: str | Path | None = None,
+    allow_interactive: bool = False,
 ) -> Any:
     """
     Authenticate with Google Tasks and return a Tasks API service object.
 
     Put your OAuth desktop-client file at ./credentials.json, or set
-    GOOGLE_TASKS_CREDENTIALS_FILE. The first call opens a browser consent flow
-    and stores reusable auth in ./token.json, or GOOGLE_TASKS_TOKEN_FILE.
+    GOOGLE_TASKS_CREDENTIALS_FILE. Reusable auth is stored in ./token.json, or
+    GOOGLE_TASKS_TOKEN_FILE.
+
+    allow_interactive must stay False anywhere the bot might call this.
+    The consent flow spins up a local web server and blocks until a browser
+    completes the redirect, which in the single-threaded polling loop would
+    freeze the bot for every chat, with no timeout and no log line. Run
+    setup_google.py once instead; only it passes allow_interactive=True.
     """
     Request, Credentials, InstalledAppFlow, build = _google_client_imports()
     credentials_file = _path_from_value_or_env(credentials_path, "GOOGLE_TASKS_CREDENTIALS_FILE", "credentials.json")
     token_file = _path_from_value_or_env(token_path, "GOOGLE_TASKS_TOKEN_FILE", "token.json")
 
-    if not credentials_file.exists():
-        raise FileNotFoundError(f"Google OAuth credentials not found at {credentials_file}. " "Download a Desktop app OAuth client JSON from Google Cloud and save it there.")
+    cache_key = (str(credentials_file), str(token_file))
+
+    if not allow_interactive and cache_key in _SERVICE_CACHE:
+        return _SERVICE_CACHE[cache_key]
 
     creds = None
     if token_file.exists():
@@ -35,15 +53,41 @@ def connect_google_tasks(
 
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(Request())
+            try:
+                creds.refresh(Request())
+            except Exception as exc:
+                # Refresh tokens for an OAuth app still in "Testing" publishing
+                # status expire after 7 days, so this fires weekly until the
+                # app is published. Say what to do instead of surfacing a raw
+                # RefreshError from deep in google.auth.
+                raise GoogleTasksNotConnected(
+                    "Google Tasks authorisation expired. Run 'python setup_google.py' "
+                    "again to renew it. To stop this recurring, set the OAuth app's "
+                    f"publishing status to 'In production' in Google Cloud. ({exc})"
+                ) from exc
         else:
+            if not allow_interactive:
+                raise GoogleTasksNotConnected(
+                    "Google Tasks is not connected yet. Run 'python setup_google.py' "
+                    "once to authorise it, then try again."
+                )
+
+            if not credentials_file.exists():
+                raise FileNotFoundError(
+                    f"Google OAuth credentials not found at {credentials_file}. "
+                    "Download a Desktop app OAuth client JSON from Google Cloud and save it there."
+                )
+
             flow = InstalledAppFlow.from_client_secrets_file(str(credentials_file), SCOPES)
             creds = flow.run_local_server(port=0)
 
         token_file.parent.mkdir(parents=True, exist_ok=True)
         token_file.write_text(creds.to_json(), encoding="utf-8")
 
-    return build("tasks", "v1", credentials=creds)
+    service = build("tasks", "v1", credentials=creds)
+    _SERVICE_CACHE[cache_key] = service
+
+    return service
 
 
 def list_task_lists(
@@ -256,6 +300,76 @@ def get_tasks_for_day(
     ]
 
 
+def get_day_review(
+    day: str | date | datetime | None = None,
+    tasklist: str | None = "all",
+    max_open: int = 40,
+    credentials_path: str | Path | None = None,
+    token_path: str | Path | None = None,
+) -> dict[str, Any]:
+    """
+    Return what was completed on a day plus everything still outstanding.
+
+    This is the shape a coach needs for a check-in: what got done, and what is
+    still hanging over you. Completed tasks are matched on completion time,
+    not due date, so finishing something early or late still counts for the
+    day you actually did it.
+
+    Open tasks are capped at max_open so a neglected list cannot flood the
+    model's context; the count reported is the true total.
+    """
+    service = connect_google_tasks(credentials_path, token_path)
+    selected_day = _date_from_value(day)
+    start, end = _day_bounds_rfc3339(selected_day)
+
+    if tasklist == "all":
+        task_lists = _list_task_lists(service)
+    else:
+        task_lists = [{"id": _tasklist_id(tasklist), "title": None}]
+
+    completed: list[dict[str, Any]] = []
+    still_open: list[dict[str, Any]] = []
+
+    for task_list in task_lists:
+        tasklist_id = task_list["id"]
+        tasklist_title = task_list.get("title")
+
+        for task in _list_tasks(
+            service=service,
+            tasklist=tasklist_id,
+            completed_min=start,
+            completed_max=end,
+            include_completed=True,
+        ):
+            if task.get("status") == "completed":
+                completed.append(_simplify_task(task, tasklist_id, tasklist_title))
+
+        for task in _list_tasks(
+            service=service,
+            tasklist=tasklist_id,
+            include_completed=False,
+        ):
+            if task.get("status") != "completed":
+                still_open.append(_simplify_task(task, tasklist_id, tasklist_title))
+
+    overdue = [
+        task
+        for task in still_open
+        if task.get("due") and _date_from_value(task["due"]) < selected_day
+    ]
+
+    return {
+        "day": selected_day.isoformat(),
+        "completed_count": len(completed),
+        "open_count": len(still_open),
+        "overdue_count": len(overdue),
+        "completed": completed,
+        "open": still_open[:max_open],
+        "open_truncated": len(still_open) > max_open,
+        "has_no_tasks_at_all": not completed and not still_open,
+    }
+
+
 def find_tasks(
     text: str,
     tasklist: str | None = "all",
@@ -303,6 +417,8 @@ def _list_tasks(
     tasklist: str,
     due_min: str | None = None,
     due_max: str | None = None,
+    completed_min: str | None = None,
+    completed_max: str | None = None,
     include_completed: bool = True,
     include_assigned: bool = True,
 ) -> list[dict[str, Any]]:
@@ -315,13 +431,20 @@ def _list_tasks(
             "maxResults": 100,
             "showCompleted": include_completed,
             "showDeleted": False,
-            "showHidden": False,
+            # Google flags completed tasks as hidden, so asking for completed
+            # tasks while leaving showHidden False silently returns none of
+            # them. The two flags have to move together.
+            "showHidden": include_completed,
             "showAssigned": include_assigned,
         }
         if due_min is not None:
             list_args["dueMin"] = due_min
         if due_max is not None:
             list_args["dueMax"] = due_max
+        if completed_min is not None:
+            list_args["completedMin"] = completed_min
+        if completed_max is not None:
+            list_args["completedMax"] = completed_max
         if page_token:
             list_args["pageToken"] = page_token
 
