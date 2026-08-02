@@ -70,7 +70,13 @@ class Handle:
 
         return "\n\n".join(file_path.read_text(encoding="utf-8") for file_path in markdown_files)
 
-    def sendMessageAgent(self, channelType: str, text: str, with_stats: bool = True) -> str:
+    def sendMessageAgent(
+        self,
+        channelType: str,
+        text: str,
+        with_stats: bool = True,
+        on_progress=None,
+    ) -> str:
         """
         gelen prompt + context + kişilik + memory -> agent -> response|tool calls -> response text
 
@@ -101,6 +107,7 @@ class Handle:
             model=self.model,
             conversation_id=self.conversation_id,
             tools=tools,
+            on_progress=on_progress,
         )
         logging.debug(f"{self.agent_name} RESPONSE: {result.response}")
 

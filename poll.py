@@ -11,6 +11,7 @@ Press Ctrl+C to stop.
 
 import logging
 import os
+import sys
 import threading
 import time
 from contextlib import contextmanager
@@ -21,6 +22,14 @@ import mainHandler
 import telegram
 
 dotenv.load_dotenv()
+
+# A Turkish console is cp1254, which cannot encode emoji. Messages are full of
+# them, and every one would dump a UnicodeEncodeError traceback into the
+# terminal - logging swallows it, so the bot survives, but the log becomes
+# unreadable exactly when something is going wrong.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 logging.basicConfig(
     level=logging.INFO,
@@ -162,6 +171,93 @@ def typing(chat_id: int):
         worker.join(timeout=1)
 
 
+THINKING_TEXT = "💭 Thinking..."
+
+# What each tool is doing, in the user's terms. A name like "list_tasks" means
+# nothing to the person waiting.
+TOOL_ACTIVITY = {
+    "list_tasks": "reading your tasks",
+    "create_task": "adding a task",
+    "complete_task": "ticking a task off",
+    "update_task": "updating a task",
+    "move_task": "moving a task",
+    "list_goals": "checking your goals",
+    "add_goal": "saving a goal",
+    "update_goal": "updating a goal",
+    "log_checkin": "writing up the day",
+    "remember": "making a note",
+    "read_context_file": "reading its notes",
+    "update_context_file": "rewriting its notes",
+}
+
+
+class ThinkingBox:
+    """A placeholder message that narrates the wait, then becomes the answer.
+
+    Editing one message rather than sending several keeps the chat clean: the
+    user ends up with a single reply, not a trail of status updates.
+    """
+
+    def __init__(self, chat_id: int, reply_to_message_id: int | None = None) -> None:
+        self.chat_id = chat_id
+        self.reply_to_message_id = reply_to_message_id
+        self.message_id: int | None = None
+        self.steps: list[str] = []
+
+    def open(self) -> None:
+        try:
+            sent = telegram.send_message(
+                self.chat_id, THINKING_TEXT, reply_to_message_id=self.reply_to_message_id
+            )
+            self.message_id = (sent or {}).get("message_id")
+        except Exception:
+            # The box is decoration; losing it must not cost the reply. Without
+            # a message_id everything below turns into a plain send.
+            logger.debug("could not open thinking box", exc_info=True)
+
+    def on_progress(self, tool_names: list[str]) -> None:
+        for name in tool_names:
+            activity = TOOL_ACTIVITY.get(name, name)
+            if activity not in self.steps:
+                self.steps.append(activity)
+
+        self._edit(THINKING_TEXT + "\n" + "\n".join(f"· {s}" for s in self.steps))
+
+    def close(self, text: str) -> None:
+        """Replace the box with the finished reply."""
+
+        chunks = split_for_telegram(text)
+
+        if self.message_id is None or not self._edit(chunks[0]):
+            # No box, or it could not be edited: send the first chunk instead.
+            # If that fails too there is nowhere left to put the reply.
+            if not self._send(chunks[0]):
+                return
+
+        # Either way chunk 0 has now been delivered exactly once.
+        for chunk in chunks[1:]:
+            self._send(chunk)
+
+    def _edit(self, text: str) -> bool:
+        if self.message_id is None:
+            return False
+
+        try:
+            telegram.edit_message_text(self.chat_id, self.message_id, text)
+            return True
+        except Exception:
+            logger.debug("could not edit thinking box", exc_info=True)
+            return False
+
+    def _send(self, text: str) -> bool:
+        try:
+            telegram.send_message(self.chat_id, text)
+            return True
+        except Exception:
+            logger.exception("could not deliver reply to %s", self.chat_id)
+            return False
+
+
 def switch_agent(chat_id: int, argument: str) -> str:
     """Show or change which agent this chat talks to."""
 
@@ -183,7 +279,7 @@ def switch_agent(chat_id: int, argument: str) -> str:
     return f"No agent called '{argument}'. Options: {', '.join(names)}"
 
 
-def answer(chat_id: int, text: str) -> str:
+def answer(chat_id: int, text: str, on_progress=None) -> str:
     """Turn an incoming message into reply text."""
 
     if text == "/agent" or text.startswith("/agent "):
@@ -208,7 +304,7 @@ def answer(chat_id: int, text: str) -> str:
         handle_name, conversation_id=conversation_id, chat_id=chat_id
     )
 
-    return handle.sendMessageAgent("telegram", text)
+    return handle.sendMessageAgent("telegram", text, on_progress=on_progress)
 
 
 def on_update(update: dict) -> None:
@@ -241,6 +337,8 @@ def on_update(update: dict) -> None:
 
         return
 
+    box: ThinkingBox | None = None
+
     try:
         if not isinstance(text, str) or not text.strip():
             telegram.send_message(chat_id, "I currently support text messages only.")
@@ -249,18 +347,31 @@ def on_update(update: dict) -> None:
         text = text.strip()
         logger.info("[%s] %s", chat_id, text)
 
-        with typing(chat_id):
-            reply = answer(chat_id, text)
+        if text.startswith("/"):
+            # Commands answer instantly; a thinking box would just flicker.
+            send_reply(chat_id, answer(chat_id, text), reply_to_message_id=message_id)
+            return
 
-        send_reply(chat_id, reply, reply_to_message_id=message_id)
+        box = ThinkingBox(chat_id, reply_to_message_id=message_id)
+        box.open()
+
+        with typing(chat_id):
+            reply = answer(chat_id, text, on_progress=box.on_progress)
+
+        box.close(reply)
 
     except Exception:
         logger.exception("Failed to answer chat %s", chat_id)
 
+        notice = "Something went wrong on my side. Check the logs."
+
         try:
-            telegram.send_message(
-                chat_id, "Something went wrong on my side. Check the logs."
-            )
+            if box is not None:
+                # Otherwise the box sits on "Thinking..." forever and the user
+                # has no idea the turn already failed.
+                box.close(notice)
+            else:
+                telegram.send_message(chat_id, notice)
         except Exception:
             logger.exception("Could not deliver the error notice to %s", chat_id)
 

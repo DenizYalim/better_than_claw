@@ -20,6 +20,7 @@ catching up after the machine was asleep will not double-message you.
 
 import argparse
 import logging
+import sys
 from datetime import date
 
 import dotenv
@@ -30,6 +31,11 @@ from poll import send_reply
 from tools._store import read_json, update_json
 
 dotenv.load_dotenv()
+
+# Same cp1254 problem as poll.py: task titles are Turkish and often have emoji.
+for _stream in (sys.stdout, sys.stderr):
+    if hasattr(_stream, "reconfigure"):
+        _stream.reconfigure(encoding="utf-8", errors="replace")
 
 logging.basicConfig(
     level=logging.INFO,

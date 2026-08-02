@@ -58,7 +58,15 @@ MAX_TOOL_ROUNDS = 8
 
 
 class Openai(Agent):
-    def get_response(self, prompt: str, context: str, model: str, conversation_id: str, tools=None) -> str:
+    def get_response(
+        self,
+        prompt: str,
+        context: str,
+        model: str,
+        conversation_id: str,
+        tools=None,
+        on_progress=None,
+    ) -> str:
         if not conversation_id:
             raise ValueError("conversation_id is required for get_response.")
 
@@ -101,6 +109,23 @@ class Openai(Agent):
             if not calls:
                 return result
 
+            logger.info(
+                "tool round %d: %s",
+                round_number + 1,
+                ", ".join(call.name for call in calls),
+            )
+
+            # Announced before the tools run, not after: the point is to say
+            # what is happening during the wait, and a Google round trip is a
+            # large part of it.
+            if on_progress is not None:
+                try:
+                    on_progress([call.name for call in calls])
+                except Exception:
+                    # Progress reporting is decoration. It must never be the
+                    # reason a reply is lost.
+                    logger.debug("progress callback failed", exc_info=True)
+
             # Only the outputs go back. The calls themselves are already stored
             # server-side against the conversation, so resending them would
             # duplicate the turn.
@@ -112,12 +137,6 @@ class Openai(Agent):
                 }
                 for call in calls
             ]
-
-            logger.info(
-                "tool round %d: %s",
-                round_number + 1,
-                ", ".join(call.name for call in calls),
-            )
 
             result.tool_calls.extend(call.name for call in calls)
             result.rounds += 1

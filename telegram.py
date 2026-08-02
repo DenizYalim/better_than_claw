@@ -66,6 +66,28 @@ def send_message(
     return telegram_request("sendMessage", payload, bot_token)
 
 
+def edit_message_text(
+    chat_id: int | str,
+    message_id: int,
+    text: str,
+    bot_token: str | None = None,
+    parse_mode: str | None = None,
+    link_preview_options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Replace the text of a message the bot already sent."""
+    if not text or not text.strip():
+        raise ValueError("text is required")
+
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": parse_mode,
+        "link_preview_options": link_preview_options,
+    }
+    return telegram_request("editMessageText", payload, bot_token)
+
+
 def send_chat_action(
     chat_id: int | str,
     action: str = "typing",
