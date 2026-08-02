@@ -1,11 +1,15 @@
 from dataclasses import dataclass
-import telegram
+import json
 from llm._openai import Openai, get_conversation_id
 from tools import Diary, GoogleTasks
 import logging
 from pathlib import Path
 
 TOOL_LIST = [{"toolName": "GoogleTasks", "class": GoogleTasks}, {"toolName": "Diary", "class": Diary}]
+
+BASE_DIR = Path(__file__).resolve().parent
+HANDLES_PATH = BASE_DIR / "handles.json"
+CONVERSATIONS_PATH = BASE_DIR / "conversations.json"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -27,9 +31,12 @@ class Handle:
 
         return "\n\n".join(file_path.read_text(encoding="utf-8") for file_path in markdown_files)
 
-    def sendMessageAgent(self, channelType: str, text: str):  # TODO add chat id later
+    def sendMessageAgent(self, channelType: str, text: str) -> str:
         """
-        gelen prompt + context + kişilik + memory -> agent -> response|tool calls -> response via telegram
+        gelen prompt + context + kişilik + memory -> agent -> response|tool calls -> response text
+
+        Returns the reply text. Delivery is the caller's job: the webhook knows
+        the real chat_id, this class does not.
         """
 
         agent = Openai()  # yea so much for abstraction
@@ -42,10 +49,8 @@ class Handle:
 
         if channelType == "cli":
             print(f"R: {response_text}")
-        elif channelType == "telegram":
-            telegram.send_message(self.telegram_chat_id, response_text)  ## TODO
 
-        return response
+        return response_text
 
     def updatePersona(self):
         pass
@@ -58,13 +63,11 @@ class Handle:
 
 
 def loadHandle(handleName: str = "default", conversation_id: str = None) -> Handle:
-    import json
-
     try:
-        with open("handles.json", "r") as f:
+        with open(HANDLES_PATH, "r", encoding="utf-8") as f:
             handles = json.load(f)
     except FileNotFoundError:
-        raise ValueError("handles.json file not found.")
+        raise ValueError(f"handles.json file not found at {HANDLES_PATH}.")
 
     for handle in handles:
         if handle.get("handleName") == handleName:
@@ -75,10 +78,36 @@ def loadHandle(handleName: str = "default", conversation_id: str = None) -> Hand
                 telegram_chat_id=handle.get("telegramChatId"),
                 model=handle.get("model"),
                 context_path=handle.get("contextPath"),
-                conversation_id=conversation_id,  # handle.get("conversationId"), # hm
+                conversation_id=conversation_id or handle.get("conversationId"),
             )
 
     raise ValueError(f"Handle with name {handleName} not found.")
+
+
+def conversationIdFor(handleName: str, chat_id: int) -> str:
+    """Return a stable OpenAI conversation id per (handle, telegram chat).
+
+    Without this every webhook call would start a fresh conversation, so the
+    agent would have no memory between messages.
+    """
+
+    key = f"{handleName}:{chat_id}"
+
+    try:
+        with open(CONVERSATIONS_PATH, "r", encoding="utf-8") as f:
+            conversations = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        conversations = {}
+
+    if key not in conversations:
+        conversations[key] = get_conversation_id()
+
+        with open(CONVERSATIONS_PATH, "w", encoding="utf-8") as f:
+            json.dump(conversations, f, indent=4)
+
+        logging.info("Started conversation %s for %s", conversations[key], key)
+
+    return conversations[key]
 
 
 if __name__ == "__main__":

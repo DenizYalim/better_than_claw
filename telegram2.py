@@ -1,8 +1,18 @@
+import hmac
 import logging
 import os
+from typing import Any
+
+import dotenv
+import requests
+from flask import abort, request
+
+dotenv.load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 BOT_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-WEBHOOK_SECRET = os.environ["TELEGRAM_WEBHOOK_SECRET"]
+WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "")
 
 TELEGRAM_API_URL = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
@@ -48,6 +58,19 @@ def send_message(
 
 
 def verify_telegram_secret() -> None:
+    """Reject webhook calls that do not carry our shared secret.
+
+    Telegram echoes back the secret_token passed to setWebhook in the
+    X-Telegram-Bot-Api-Secret-Token header. Without it the endpoint is open
+    to anyone who guesses the URL.
+    """
+
+    if not WEBHOOK_SECRET:
+        logger.warning(
+            "TELEGRAM_WEBHOOK_SECRET is not set - webhook is unauthenticated."
+        )
+        return
+
     received_secret = request.headers.get(
         "X-Telegram-Bot-Api-Secret-Token",
         "",

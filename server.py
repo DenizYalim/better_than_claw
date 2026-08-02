@@ -1,12 +1,11 @@
-import hmac
 import logging
-import os
-from typing import Any
 
-import requests
-from flask import Flask, abort, request
+from flask import Flask, request
+
 import telegram2
 import mainHandler
+
+HANDLE_NAME = "default"
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,7 +32,9 @@ def handle_message(
     if text == "/help":
         return "Available commands:\n" "/start\n" "/help"
 
-    handle = mainHandler.loadHandle("default")  # TODO
+    conversation_id = mainHandler.conversationIdFor(HANDLE_NAME, chat_id)
+
+    handle = mainHandler.loadHandle(HANDLE_NAME, conversation_id=conversation_id)
 
     return handle.sendMessageAgent("telegram", text)
 
@@ -53,7 +54,7 @@ def health() -> dict[str, str]:
 
 @app.post("/telegram/webhook")
 def telegram_webhook() -> tuple[dict[str, bool], int]:
-    verify_telegram_secret()
+    telegram2.verify_telegram_secret()
 
     update = request.get_json(silent=True)
 
@@ -113,6 +114,15 @@ def telegram_webhook() -> tuple[dict[str, bool], int]:
             "Failed to process update %s",
             update.get("update_id"),
         )
+
+        try:
+            telegram2.send_message(
+                chat_id=chat_id,
+                text="Something went wrong on my side. Check the server logs.",
+                reply_to_message_id=message_id,
+            )
+        except Exception:
+            logger.exception("Could not deliver the error notice to %s", chat_id)
 
         # Return 200 so Telegram does not repeatedly deliver
         # a message that failed inside the application.
