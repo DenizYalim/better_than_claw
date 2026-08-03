@@ -4,5 +4,5 @@ token.json
 __pycache__/
 *.pyc
 *.json
-lifeCoach/
-CLAUDE.md
+lifeCoach/ 
+CLAUDE.md  

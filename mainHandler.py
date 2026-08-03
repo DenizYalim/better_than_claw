@@ -1,13 +1,52 @@
-from dataclasses import dataclass
-import telegram
+from dataclasses import dataclass, field
+import json
+import time
 from llm._openai import Openai, get_conversation_id
-from tools import Diary, GoogleTasks
+from tools import build_registry
+from tools._store import read_json as _loadStore, update_json as _updateStore
 import logging
 from pathlib import Path
 
-TOOL_LIST = [{"toolName": "GoogleTasks", "class": GoogleTasks}, {"toolName": "Diary", "class": Diary}]
+BASE_DIR = Path(__file__).resolve().parent
+HANDLES_PATH = BASE_DIR / "handles.json"
+CONVERSATIONS_PATH = BASE_DIR / "conversations.json"
+ACTIVE_HANDLES_PATH = BASE_DIR / "active_handles.json"
+
+DEFAULT_HANDLE = "default"
+
+# Every request re-sends the whole stored conversation, and tool results are
+# stored too - a single list_tasks result is over a thousand tokens and is then
+# replayed on every round of every later message, forever. Past this size a
+# chat starts a fresh conversation.
+#
+# This is only safe because durable memory does not live in the conversation:
+# goals, check-ins and MEMORY.md are held by tools and survive a rotation. What
+# is lost is the recent back-and-forth, which is the cheap part to lose.
+MAX_CONVERSATION_TOKENS = 30_000
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+
+
+def formatTokens(count: int) -> str:
+    if count >= 1_000_000:
+        return f"{count / 1_000_000:.1f}M"
+    if count >= 1_000:
+        return f"{count / 1_000:.1f}K"
+    return str(count)
+
+
+def formatDuration(seconds: float) -> str:
+    # Sub-10s replies are the common case, and "3sec" vs "3.4sec" is the
+    # difference between useless and informative at that scale. The bound is
+    # 9.95 rather than 10 so a value that rounds to ten prints "10sec", not
+    # "10.0sec".
+    if seconds < 9.95:
+        return f"{seconds:.1f}sec"
+    return f"{seconds:.0f}sec"
+
+
+def formatStats(total_tokens: int, seconds: float) -> str:
+    return f"T:{formatTokens(total_tokens)} - {formatDuration(seconds)}"
 
 
 @dataclass
@@ -18,6 +57,10 @@ class Handle:
     model: str
     context_path: str
     conversation_id: str  # this can be optional
+    tool_names: list[str] = field(default_factory=list)
+    chat_id: int | None = None
+    # The key conversations are stored under, so a handle can rotate its own.
+    handle_name: str = ""
 
     def _build_context_from_md(self, context_path: Path) -> str:
         if not context_path.is_dir():
@@ -27,25 +70,80 @@ class Handle:
 
         return "\n\n".join(file_path.read_text(encoding="utf-8") for file_path in markdown_files)
 
-    def sendMessageAgent(self, channelType: str, text: str):  # TODO add chat id later
+    def sendMessageAgent(
+        self,
+        channelType: str,
+        text: str,
+        with_stats: bool = True,
+        on_progress=None,
+    ) -> str:
         """
-        gelen prompt + context + kişilik + memory -> agent -> response|tool calls -> response via telegram
+        gelen prompt + context + kişilik + memory -> agent -> response|tool calls -> response text
+
+        Returns the reply text, with a token/time footer unless with_stats is
+        False. Delivery is the caller's job: the poller knows the real chat_id,
+        this class does not.
         """
 
+        started = time.monotonic()
         agent = Openai()  # yea so much for abstraction
 
-        context = self._build_context_from_md(Path(self.context_path))  # should add tools to here as well later
+        context = self._build_context_from_md(Path(self.context_path))
         logging.debug(f"{self.agent_name} GIVEN CONTEXT: {context}")
-        response = agent.get_response(text, context=context, model=self.model, conversation_id=self.conversation_id)  # what to do for tool loop calls?
-        logging.debug(f"{self.agent_name} RESPONSE: {response}")
-        response_text = response.output_text.strip()
+
+        # Tools are bound to a chat and to this handle's own context directory,
+        # never chosen by the model: goal tools can only touch the conversation
+        # they were called from, and context tools can only rewrite this agent's
+        # own markdown.
+        tools = build_registry(
+            self.tool_names,
+            self.chat_id or self.telegram_chat_id,
+            context_path=self.context_path,
+        )
+
+        result = agent.get_response(
+            text,
+            context=context,
+            model=self.model,
+            conversation_id=self.conversation_id,
+            tools=tools,
+            on_progress=on_progress,
+        )
+        logging.debug(f"{self.agent_name} RESPONSE: {result.response}")
+
+        elapsed = time.monotonic() - started
+        response_text = result.text
+
+        logging.info(
+            "%s replied in %.1fs using %d tokens over %d round(s), history %d%s",
+            self.agent_name,
+            elapsed,
+            result.total_tokens,
+            result.rounds,
+            result.last_input_tokens,
+            f" [{', '.join(result.tool_calls)}]" if result.tool_calls else "",
+        )
+
+        if self.handle_name:
+            rotateIfTooLarge(self.handle_name, self.chat_id, result.last_input_tokens)
+
+        if not response_text:
+            # Say so here rather than downstream: once the stats footer is
+            # appended the text is no longer empty, so send_reply's own guard
+            # would not fire and the user would receive a bare "T:3.9K - 2sec".
+            logging.warning("%s returned an empty response", self.agent_name)
+            response_text = "(the agent returned an empty response)"
+
+        if with_stats:
+            stats = formatStats(result.total_tokens, elapsed)
+            # Blank line so the footer reads as metadata rather than as
+            # something the coach said.
+            response_text = f"{response_text}\n\n{stats}"
 
         if channelType == "cli":
             print(f"R: {response_text}")
-        elif channelType == "telegram":
-            telegram.send_message(self.telegram_chat_id, response_text)  ## TODO
 
-        return response
+        return response_text
 
     def updatePersona(self):
         pass
@@ -57,16 +155,8 @@ class Handle:
         pass
 
 
-def loadHandle(handleName: str = "default", conversation_id: str = None) -> Handle:
-    import json
-
-    try:
-        with open("handles.json", "r") as f:
-            handles = json.load(f)
-    except FileNotFoundError:
-        raise ValueError("handles.json file not found.")
-
-    for handle in handles:
+def loadHandle(handleName: str = "default", conversation_id: str = None, chat_id: int = None) -> Handle:
+    for handle in loadHandleConfigs():
         if handle.get("handleName") == handleName:
 
             return Handle(
@@ -75,10 +165,127 @@ def loadHandle(handleName: str = "default", conversation_id: str = None) -> Hand
                 telegram_chat_id=handle.get("telegramChatId"),
                 model=handle.get("model"),
                 context_path=handle.get("contextPath"),
-                conversation_id=conversation_id,  # handle.get("conversationId"), # hm
+                conversation_id=conversation_id or handle.get("conversationId"),
+                tool_names=handle.get("tools") or [],
+                chat_id=chat_id,
+                handle_name=handleName,
             )
 
     raise ValueError(f"Handle with name {handleName} not found.")
+
+
+def loadHandleConfigs() -> list[dict]:
+    try:
+        with open(HANDLES_PATH, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except FileNotFoundError:
+        raise ValueError(f"handles.json file not found at {HANDLES_PATH}.")
+
+
+def handleNames() -> list[str]:
+    return [handle.get("handleName") for handle in loadHandleConfigs()]
+
+
+def activeHandleFor(chat_id: int) -> str:
+    """Which agent this chat is currently talking to.
+
+    Falls back to the default if the stored handle has since been renamed or
+    removed from handles.json. Without this the chat is stuck: every message
+    raises "Handle not found", and the user only sees a generic failure.
+    """
+
+    name = _loadStore(ACTIVE_HANDLES_PATH).get(str(chat_id), DEFAULT_HANDLE)
+
+    if name not in handleNames():
+        logging.warning(
+            "Chat %s points at unknown handle %r; falling back to %s",
+            chat_id,
+            name,
+            DEFAULT_HANDLE,
+        )
+        return DEFAULT_HANDLE
+
+    return name
+
+
+def setActiveHandle(chat_id: int, handleName: str) -> None:
+    if handleName not in handleNames():
+        raise ValueError(f"No handle named {handleName}")
+
+    _updateStore(ACTIVE_HANDLES_PATH, lambda data: data.__setitem__(str(chat_id), handleName))
+
+    logging.info("Chat %s switched to handle %s", chat_id, handleName)
+
+
+def conversationIdFor(handleName: str, chat_id: int) -> str:
+    """Return a stable OpenAI conversation id per (handle, telegram chat).
+
+    Without this every message would start a fresh conversation, so the
+    agent would have no memory between messages.
+    """
+
+    key = f"{handleName}:{chat_id}"
+    existing = _loadStore(CONVERSATIONS_PATH).get(key)
+
+    if existing:
+        return existing
+
+    # Create the conversation outside the lock: it is a network call, and
+    # holding the lock across it would stall every other write for its
+    # duration. The re-check inside the lock settles any race.
+    fresh_id = get_conversation_id()
+
+    def mutate(conversations: dict) -> str:
+        if key not in conversations:
+            conversations[key] = fresh_id
+            logging.info("Started conversation %s for %s", fresh_id, key)
+        return conversations[key]
+
+    return _updateStore(CONVERSATIONS_PATH, mutate)
+
+
+def rotateIfTooLarge(handleName: str, chat_id: int, last_input_tokens: int) -> bool:
+    """Start a fresh conversation once the old one is expensive to carry.
+
+    Called after replying, so the current turn is unaffected and the saving
+    lands on the next message.
+    """
+
+    if chat_id is None or last_input_tokens < MAX_CONVERSATION_TOKENS:
+        return False
+
+    previous = resetConversation(handleName, chat_id)
+
+    logging.warning(
+        "Conversation for %s:%s reached %d input tokens; rotated. Previous: %s",
+        handleName,
+        chat_id,
+        last_input_tokens,
+        previous,
+    )
+
+    return True
+
+
+def resetConversation(handleName: str, chat_id: int) -> str | None:
+    """Forget one chat's history. Returns the dropped id, or None if there
+    was nothing to drop.
+
+    The OpenAI conversation object itself is left alone rather than deleted,
+    so a reset stays recoverable: the orphaned id goes to the log, and the
+    transcript can still be read back through the API.
+    """
+
+    key = f"{handleName}:{chat_id}"
+
+    previous = _updateStore(CONVERSATIONS_PATH, lambda conversations: conversations.pop(key, None))
+
+    if previous is None:
+        return None
+
+    logging.info("Reset %s. Orphaned conversation left on OpenAI: %s", key, previous)
+
+    return previous
 
 
 if __name__ == "__main__":

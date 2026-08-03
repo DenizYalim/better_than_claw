@@ -13,9 +13,19 @@ from typing import Any
 API_BASE_URL = "https://api.telegram.org"
 DEFAULT_TIMEOUT_SECONDS = 30
 
+# During a long poll Telegram deliberately holds the connection open for the
+# full timeout before answering. The socket read timeout must therefore be
+# longer than the poll window, or the socket gives up at the exact moment the
+# reply is due and every idle cycle dies.
+READ_TIMEOUT_BUFFER_SECONDS = 15
+
 
 class TelegramAPIError(RuntimeError):
     """Raised when Telegram returns an API error."""
+
+    def __init__(self, message: str, status_code: int | None = None) -> None:
+        super().__init__(message)
+        self.status_code = status_code
 
 
 def send_message(
@@ -56,6 +66,47 @@ def send_message(
     return telegram_request("sendMessage", payload, bot_token)
 
 
+def edit_message_text(
+    chat_id: int | str,
+    message_id: int,
+    text: str,
+    bot_token: str | None = None,
+    parse_mode: str | None = None,
+    link_preview_options: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Replace the text of a message the bot already sent."""
+    if not text or not text.strip():
+        raise ValueError("text is required")
+
+    payload = {
+        "chat_id": chat_id,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": parse_mode,
+        "link_preview_options": link_preview_options,
+    }
+    return telegram_request("editMessageText", payload, bot_token)
+
+
+def send_chat_action(
+    chat_id: int | str,
+    action: str = "typing",
+    bot_token: str | None = None,
+    message_thread_id: int | None = None,
+) -> dict[str, Any]:
+    """Show "typing..." in the chat.
+
+    Telegram clears it after about five seconds or as soon as a message
+    arrives, so a slow reply needs this repeated rather than sent once.
+    """
+    payload = {
+        "chat_id": chat_id,
+        "action": action,
+        "message_thread_id": message_thread_id,
+    }
+    return telegram_request("sendChatAction", payload, bot_token)
+
+
 def get_me(bot_token: str | None = None) -> dict[str, Any]:
     """Return basic information about the bot and validate the token."""
     return telegram_request("getMe", bot_token=bot_token)
@@ -80,7 +131,12 @@ def get_updates(
         "limit": limit,
         "allowed_updates": allowed_updates,
     }
-    return telegram_request("getUpdates", payload, bot_token)
+    return telegram_request(
+        "getUpdates",
+        payload,
+        bot_token,
+        read_timeout=timeout + READ_TIMEOUT_BUFFER_SECONDS,
+    )
 
 
 def listen(
@@ -190,6 +246,7 @@ def telegram_request(
     method: str,
     payload: dict[str, Any] | None = None,
     bot_token: str | None = None,
+    read_timeout: float | None = None,
 ) -> Any:
     """Call a Telegram Bot API method and return its result field."""
     token = _resolve_bot_token(bot_token)
@@ -203,11 +260,19 @@ def telegram_request(
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=DEFAULT_TIMEOUT_SECONDS) as resp:
+        with urllib.request.urlopen(
+            request,
+            timeout=read_timeout if read_timeout is not None else DEFAULT_TIMEOUT_SECONDS,
+        ) as resp:
             response = json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as exc:
         raise _error_from_http(method, exc) from exc
     except urllib.error.URLError as exc:
+        raise TelegramAPIError(f"Telegram API {method} request failed: {exc}") from exc
+    except OSError as exc:
+        # A socket read timeout surfaces as a bare TimeoutError, not URLError,
+        # so without this it escapes as a non-TelegramAPIError and defeats
+        # every caller's retry handling.
         raise TelegramAPIError(f"Telegram API {method} request failed: {exc}") from exc
 
     if not response.get("ok"):
@@ -271,5 +336,6 @@ def _error_from_http(method: str, exc: urllib.error.HTTPError) -> TelegramAPIErr
     except json.JSONDecodeError:
         description = body
     return TelegramAPIError(
-        f"Telegram API {method} failed with HTTP {exc.code}: {description}"
+        f"Telegram API {method} failed with HTTP {exc.code}: {description}",
+        status_code=exc.code,
     )
